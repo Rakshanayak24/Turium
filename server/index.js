@@ -166,12 +166,22 @@ app.post('/query', async (req, res, next) => {
       let score = -1;
       if (vector.length === queryVector.length) score = vector.reduce((sum, value, i) => sum + value * queryVector[i], 0);
       return { ...row, score };
-    }).sort((a, b) => b.score - a.score).slice(0, 5);
-    const sources = ranked.map((row, i) => ({ id: i + 1, item_id: row.item_id, title: row.title, source_type: row.source_type,
+    }).sort((a, b) => b.score - a.score);
+    const minScore = apiKey() ? 0.18 : 0.08;
+    const bestScore = ranked[0]?.score ?? -1;
+    const usedItems = new Set();
+    const relevant = ranked.filter((row) => {
+      if (row.score < minScore || row.score < bestScore * 0.58 || usedItems.has(row.item_id)) return false;
+      usedItems.add(row.item_id);
+      return true;
+    }).slice(0, 3);
+    const sources = relevant.map((row, i) => ({ id: i + 1, item_id: row.item_id, title: row.title, source_type: row.source_type,
       source_url: row.source_url, snippet: row.content.slice(0, 420), score: Number(row.score.toFixed(3)) }));
     let answer;
-    if (apiKey()) {
-      const context = ranked.map((row, i) => `[${i + 1}] ${row.title}\n${row.content}`).join('\n\n');
+    if (!relevant.length) {
+      answer = 'I could not find a close match in your saved content. Try different wording or save another note or page.';
+    } else if (apiKey()) {
+      const context = relevant.map((row, i) => `[${i + 1}] ${row.title}\n${row.content}`).join('\n\n');
       const response = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST', headers: { Authorization: `Bearer ${apiKey()}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: process.env.OPENAI_CHAT_MODEL || 'gpt-4o-mini', temperature: 0.2, messages: [
@@ -183,10 +193,19 @@ app.post('/query', async (req, res, next) => {
       answer = (await response.json()).choices?.[0]?.message?.content?.trim();
       if (!answer) throw new Error('Answer provider returned an empty response');
     } else {
-      const best = ranked[0];
-      answer = best.score > 0.08
-        ? `The closest match in your saved content says: “${best.content.slice(0, 360).trim()}${best.content.length > 360 ? '…' : ''}” [1]\n\nThis is a locally generated excerpt. Add an OpenAI API key for a synthesized answer.`
-        : 'I could not find a close match in your saved content. Try different wording or save another note or page.';
+      const best = relevant[0];
+      const stopWords = new Set(['what','does','did','my','note','suggest','i','do','each','the','a','an','is','are','was','were','to','in','on','and','of','for','with','your','you','it','should','could','have','been','find','about','remember','tell','me','from','this','that']);
+      const stem = (word) => word.toLowerCase().replace(/(?:ing|ed|ly|es|s)$/u, '');
+      const terms = (text) => (text.toLowerCase().match(/[\p{L}\p{N}]+/gu) || []).map(stem).filter((word) => word.length > 2 && !stopWords.has(word));
+      const queryTerms = new Set(terms(question));
+      const sentences = best.content.match(/[^.!?]+[.!?]?/gu) || [best.content];
+      const answerSentence = sentences.map((sentence) => ({
+        sentence: sentence.trim(),
+        score: terms(sentence).reduce((sum, word) => sum + (queryTerms.has(word) ? 1 : 0), 0),
+      })).sort((a, b) => b.score - a.score)[0];
+      answer = answerSentence?.score
+        ? `${answerSentence.sentence} [1]`
+        : `The closest saved passage says: “${best.content.slice(0, 280).trim()}${best.content.length > 280 ? '…' : ''}” [1]`;
     }
     log('info', 'question_answered', { chunksSearched: count, sources: sources.length, durationMs: Date.now() - started, ai: apiKey() ? 'openai' : 'local' });
     res.json({ answer, sources, mode: apiKey() ? 'openai' : 'local' });
